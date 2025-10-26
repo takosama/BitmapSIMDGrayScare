@@ -1,64 +1,83 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Jobs;
 using BenchmarkDotNet.Running;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
-using System.Runtime.Intrinsics.Arm;
 
-namespace BitmapSIMDGrayScare
+namespace ConsoleApp67
 {
-    public class Program
+    class Program
     {
-        public static void Main(string[] args)
+        unsafe static void Main(string[] args)
         {
-            BenchmarkRunner.Run<GrayscaleBenchmark>();
+            BenchmarkRunner.Run<test>();
         }
     }
 
     [SimpleJob(RuntimeMoniker.HostProcess, launchCount: 1, warmupCount: 5, iterationCount: 15)]
     [MemoryDiagnoser]
-    public unsafe class GrayscaleBenchmark : IDisposable
+    public unsafe class test : IDisposable
     {
-        private const int Width = 1280;
-        private const int Height = 720;
         private const int Iterations = 100;
-        private const int Alignment = 64;
+        private const nuint Alignment = 64;
+
+        [ParamsSource(nameof(GetTestImages))]
+        public ImageSpec Spec { get; set; } = ImageSpec.Hd;
+
+        private static readonly ParallelOptions RowParallelOptions = new()
+        {
+            MaxDegreeOfParallelism = Environment.ProcessorCount
+        };
 
         private byte* _source;
         private byte* _destination;
-        private int _bufferLength;
-
         private readonly Random _random = new(42);
 
-        private static readonly int ProcessorCount = Environment.ProcessorCount;
-
-        private delegate void Converter(byte* source, byte* destination, int width, int height, int stride);
+        private delegate void Converter(byte* source, byte* destination, in ImageSpec spec);
 
         private static readonly Converter ScalarPath = ScalarGrayscale;
         private static readonly Converter Avx2Path = Avx2.IsSupported ? Avx2Grayscale : ScalarGrayscale;
         private static readonly Converter Avx512Path = Avx512F.IsSupported && Avx512BW.IsSupported ? Avx512Grayscale : Avx2Path;
         private static readonly Converter FmaPath = Fma.IsSupported && Avx.IsSupported ? FmaGrayscale : Avx2Path;
-        private static readonly Converter ArmPath = AdvSimd.Arm64.IsSupported ? AdvSimdGrayscale : ScalarGrayscale;
+        private static readonly Converter AdvSimdPath = AdvSimd.Arm64.IsSupported ? AdvSimdGrayscale : ScalarGrayscale;
+
+        public static IEnumerable<ImageSpec> GetTestImages()
+        {
+            yield return ImageSpec.Hd;
+            yield return ImageSpec.FullHd;
+        }
 
         [GlobalSetup]
         public void Setup()
         {
-            _bufferLength = Width * Height * 4;
-            _source = (byte*)NativeMemory.AlignedAlloc((nuint)_bufferLength, (nuint)Alignment);
-            _destination = (byte*)NativeMemory.AlignedAlloc((nuint)_bufferLength, (nuint)Alignment);
+            Cleanup();
 
-            FillRandom(_source, _bufferLength);
+            int byteLength = Spec.BufferLength;
+            _source = (byte*)NativeMemory.AlignedAlloc((nuint)byteLength, Alignment);
+            _destination = (byte*)NativeMemory.AlignedAlloc((nuint)byteLength, Alignment);
+            FillRandom(_source, byteLength);
         }
 
         [GlobalCleanup]
         public void Cleanup()
         {
-            NativeMemory.AlignedFree(_source);
-            NativeMemory.AlignedFree(_destination);
+            if (_source != null)
+            {
+                NativeMemory.AlignedFree(_source);
+                _source = null;
+            }
+
+            if (_destination != null)
+            {
+                NativeMemory.AlignedFree(_destination);
+                _destination = null;
+            }
         }
 
         public void Dispose()
@@ -91,9 +110,9 @@ namespace BitmapSIMDGrayScare
         }
 
         [Benchmark]
-        public void OptimizedArm()
+        public void OptimizedAdvSimd()
         {
-            RunIterations(ArmPath);
+            RunIterations(AdvSimdPath);
         }
 
         [Benchmark]
@@ -112,7 +131,7 @@ namespace BitmapSIMDGrayScare
         {
             for (int i = 0; i < Iterations; i++)
             {
-                converter(_source, _destination, Width, Height, Width * 4);
+                converter(_source, _destination, Spec);
             }
         }
 
@@ -121,18 +140,19 @@ namespace BitmapSIMDGrayScare
             Span<byte> span = new(buffer, length);
             _random.NextBytes(span);
         }
-        private static void ScalarGrayscale(byte* source, byte* destination, int width, int height, int stride)
+
+        private static void ScalarGrayscale(byte* source, byte* destination, in ImageSpec spec)
         {
             const int rWeight = 77;
             const int gWeight = 150;
             const int bWeight = 29;
 
-            for (int y = 0; y < height; y++)
+            for (int y = 0; y < spec.Height; y++)
             {
-                byte* srcRow = source + y * stride;
-                byte* dstRow = destination + y * stride;
+                byte* srcRow = source + y * spec.Stride;
+                byte* dstRow = destination + y * spec.Stride;
 
-                for (int x = 0; x < width; x++)
+                for (int x = 0; x < spec.Width; x++)
                 {
                     int pixelIndex = x * 4;
                     byte b = srcRow[pixelIndex + 0];
@@ -145,22 +165,23 @@ namespace BitmapSIMDGrayScare
                         gray = 255;
                     }
 
-                    dstRow[pixelIndex + 0] = (byte)gray;
-                    dstRow[pixelIndex + 1] = (byte)gray;
-                    dstRow[pixelIndex + 2] = (byte)gray;
+                    byte grayByte = (byte)gray;
+                    dstRow[pixelIndex + 0] = grayByte;
+                    dstRow[pixelIndex + 1] = grayByte;
+                    dstRow[pixelIndex + 2] = grayByte;
                     dstRow[pixelIndex + 3] = 255;
                 }
             }
         }
 
-        private static void Avx2Grayscale(byte* source, byte* destination, int width, int height, int stride)
+        private static void Avx2Grayscale(byte* source, byte* destination, in ImageSpec spec)
         {
-            int simdWidth = width & ~15;
+            int simdWidth = spec.Width & ~15;
 
-            for (int y = 0; y < height; y++)
+            for (int y = 0; y < spec.Height; y++)
             {
-                byte* srcRow = source + y * stride;
-                byte* dstRow = destination + y * stride;
+                byte* srcRow = source + y * spec.Stride;
+                byte* dstRow = destination + y * spec.Stride;
 
                 int x = 0;
                 for (; x < simdWidth; x += 16)
@@ -182,7 +203,7 @@ namespace BitmapSIMDGrayScare
                     Avx.Store(dstRow + offset + 32, upperGray);
                 }
 
-                for (; x < width; x++)
+                for (; x < spec.Width; x++)
                 {
                     int pixelIndex = x * 4;
                     byte b = srcRow[pixelIndex + 0];
@@ -195,22 +216,23 @@ namespace BitmapSIMDGrayScare
                         gray = 255;
                     }
 
-                    dstRow[pixelIndex + 0] = (byte)gray;
-                    dstRow[pixelIndex + 1] = (byte)gray;
-                    dstRow[pixelIndex + 2] = (byte)gray;
+                    byte grayByte = (byte)gray;
+                    dstRow[pixelIndex + 0] = grayByte;
+                    dstRow[pixelIndex + 1] = grayByte;
+                    dstRow[pixelIndex + 2] = grayByte;
                     dstRow[pixelIndex + 3] = 255;
                 }
             }
         }
 
-        private static void Avx512Grayscale(byte* source, byte* destination, int width, int height, int stride)
+        private static void Avx512Grayscale(byte* source, byte* destination, in ImageSpec spec)
         {
-            int simdWidth = width & ~31;
+            int simdWidth = spec.Width & ~31;
 
-            for (int y = 0; y < height; y++)
+            for (int y = 0; y < spec.Height; y++)
             {
-                byte* srcRow = source + y * stride;
-                byte* dstRow = destination + y * stride;
+                byte* srcRow = source + y * spec.Stride;
+                byte* dstRow = destination + y * spec.Stride;
 
                 int x = 0;
                 for (; x < simdWidth; x += 32)
@@ -227,7 +249,7 @@ namespace BitmapSIMDGrayScare
                     Avx.Store(dstRow + offset + 32, upperGray);
                 }
 
-                for (; x < width; x++)
+                for (; x < spec.Width; x++)
                 {
                     int pixelIndex = x * 4;
                     byte b = srcRow[pixelIndex + 0];
@@ -240,15 +262,23 @@ namespace BitmapSIMDGrayScare
                         gray = 255;
                     }
 
-                    dstRow[pixelIndex + 0] = (byte)gray;
-                    dstRow[pixelIndex + 1] = (byte)gray;
-                    dstRow[pixelIndex + 2] = (byte)gray;
+                    byte grayByte = (byte)gray;
+                    dstRow[pixelIndex + 0] = grayByte;
+                    dstRow[pixelIndex + 1] = grayByte;
+                    dstRow[pixelIndex + 2] = grayByte;
                     dstRow[pixelIndex + 3] = 255;
                 }
             }
         }
-        private static void FmaGrayscale(byte* source, byte* destination, int width, int height, int stride)
+
+        private static void FmaGrayscale(byte* source, byte* destination, in ImageSpec spec)
         {
+            if (!Fma.IsSupported || !Avx.IsSupported)
+            {
+                ScalarGrayscale(source, destination, spec);
+                return;
+            }
+
             Span<float> weights = stackalloc float[] { 0.114f, 0.587f, 0.299f };
             Vector256<float> bWeight = Vector256.Create(weights[0]);
             Vector256<float> gWeight = Vector256.Create(weights[1]);
@@ -260,12 +290,12 @@ namespace BitmapSIMDGrayScare
             Span<float> bufferR = stackalloc float[8];
             Span<float> grayTemp = stackalloc float[8];
 
-            for (int y = 0; y < height; y++)
+            for (int y = 0; y < spec.Height; y++)
             {
-                byte* srcRow = source + y * stride;
-                byte* dstRow = destination + y * stride;
+                byte* srcRow = source + y * spec.Stride;
+                byte* dstRow = destination + y * spec.Stride;
                 int x = 0;
-                int simdWidth = width & ~7;
+                int simdWidth = spec.Width & ~7;
 
                 for (; x < simdWidth; x += 8)
                 {
@@ -308,7 +338,7 @@ namespace BitmapSIMDGrayScare
                     }
                 }
 
-                for (; x < width; x++)
+                for (; x < spec.Width; x++)
                 {
                     int pixelIndex = x * 4;
                     float gray = srcRow[pixelIndex + 2] * weights[2] + srcRow[pixelIndex + 1] * weights[1] + srcRow[pixelIndex + 0] * weights[0] + 0.5f;
@@ -321,13 +351,13 @@ namespace BitmapSIMDGrayScare
             }
         }
 
-        private static void ParallelAvx2Grayscale(byte* source, byte* destination, int width, int height, int stride)
+        private static void ParallelAvx2Grayscale(byte* source, byte* destination, in ImageSpec spec)
         {
-            Parallel.For(0, height, new ParallelOptions { MaxDegreeOfParallelism = ProcessorCount }, y =>
+            Parallel.For(0, spec.Height, RowParallelOptions, y =>
             {
-                byte* srcRow = source + y * stride;
-                byte* dstRow = destination + y * stride;
-                Avx2Row(srcRow, dstRow, width);
+                byte* srcRow = source + y * spec.Stride;
+                byte* dstRow = destination + y * spec.Stride;
+                Avx2Row(srcRow, dstRow, spec.Width);
             });
         }
 
@@ -359,29 +389,31 @@ namespace BitmapSIMDGrayScare
                     gray = 255;
                 }
 
-                dstRow[pixelIndex + 0] = (byte)gray;
-                dstRow[pixelIndex + 1] = (byte)gray;
-                dstRow[pixelIndex + 2] = (byte)gray;
+                byte grayByte = (byte)gray;
+                dstRow[pixelIndex + 0] = grayByte;
+                dstRow[pixelIndex + 1] = grayByte;
+                dstRow[pixelIndex + 2] = grayByte;
                 dstRow[pixelIndex + 3] = 255;
             }
         }
-        private static void AdvSimdGrayscale(byte* source, byte* destination, int width, int height, int stride)
+
+        private static void AdvSimdGrayscale(byte* source, byte* destination, in ImageSpec spec)
         {
             if (!AdvSimd.Arm64.IsSupported)
             {
-                ScalarGrayscale(source, destination, width, height, stride);
+                ScalarGrayscale(source, destination, spec);
                 return;
             }
 
             Span<byte> lane = stackalloc byte[16];
 
-            for (int y = 0; y < height; y++)
+            for (int y = 0; y < spec.Height; y++)
             {
-                byte* srcRow = source + y * stride;
-                byte* dstRow = destination + y * stride;
+                byte* srcRow = source + y * spec.Stride;
+                byte* dstRow = destination + y * spec.Stride;
 
                 int x = 0;
-                int simdWidth = width & ~3;
+                int simdWidth = spec.Width & ~3;
 
                 for (; x < simdWidth; x += 4)
                 {
@@ -391,10 +423,10 @@ namespace BitmapSIMDGrayScare
 
                     for (int i = 0; i < 4; i++)
                     {
-                        int pixelIndex = i * 4;
-                        byte b = lane[pixelIndex + 0];
-                        byte g = lane[pixelIndex + 1];
-                        byte r = lane[pixelIndex + 2];
+                        int laneIndex = i * 4;
+                        byte b = lane[laneIndex + 0];
+                        byte g = lane[laneIndex + 1];
+                        byte r = lane[laneIndex + 2];
 
                         int gray = (77 * r + 150 * g + 29 * b + 128) >> 8;
                         if (gray > 255)
@@ -403,14 +435,15 @@ namespace BitmapSIMDGrayScare
                         }
 
                         byte grayByte = (byte)gray;
-                        dstRow[offset + pixelIndex + 0] = grayByte;
-                        dstRow[offset + pixelIndex + 1] = grayByte;
-                        dstRow[offset + pixelIndex + 2] = grayByte;
-                        dstRow[offset + pixelIndex + 3] = 255;
+                        int dstIndex = offset + laneIndex;
+                        dstRow[dstIndex + 0] = grayByte;
+                        dstRow[dstIndex + 1] = grayByte;
+                        dstRow[dstIndex + 2] = grayByte;
+                        dstRow[dstIndex + 3] = 255;
                     }
                 }
 
-                for (; x < width; x++)
+                for (; x < spec.Width; x++)
                 {
                     int pixelIndex = x * 4;
                     byte b = srcRow[pixelIndex + 0];
@@ -422,13 +455,15 @@ namespace BitmapSIMDGrayScare
                         gray = 255;
                     }
 
-                    dstRow[pixelIndex + 0] = (byte)gray;
-                    dstRow[pixelIndex + 1] = (byte)gray;
-                    dstRow[pixelIndex + 2] = (byte)gray;
+                    byte grayByte = (byte)gray;
+                    dstRow[pixelIndex + 0] = grayByte;
+                    dstRow[pixelIndex + 1] = grayByte;
+                    dstRow[pixelIndex + 2] = grayByte;
                     dstRow[pixelIndex + 3] = 255;
                 }
             }
         }
+
         private static Vector256<byte> ConvertBlock256(Vector256<byte> bgra)
         {
             Vector256<byte> bgPairs = Avx2.Shuffle(bgra, ShuffleBgMask256);
@@ -444,8 +479,8 @@ namespace BitmapSIMDGrayScare
             sum = Avx2.Add(sum, rWeighted);
             sum = Avx2.Add(sum, Rounding256);
 
-            Vector256<short> gray16 = Avx2.ShiftRightLogical(sum.AsUInt16(), 8).AsInt16();
-            Vector256<byte> grayBytes = Avx2.PackUnsignedSaturate(gray16, gray16);
+            Vector256<ushort> gray16 = Avx2.ShiftRightLogical(sum.AsUInt16(), 8);
+            Vector256<byte> grayBytes = Avx2.PackUnsignedSaturate(gray16.AsInt16(), gray16.AsInt16());
 
             Vector256<byte> replicated = Avx2.Shuffle(grayBytes, DuplicateGrayShuffle256);
             return Avx2.Or(replicated, AlphaMask256);
@@ -457,7 +492,7 @@ namespace BitmapSIMDGrayScare
 
         private static readonly Vector256<short> Rounding256 = Vector256.Create(
             (short)128, 128, 128, 128, 128, 128, 128, 128,
-            0, 0, 0, 0, 0, 0, 0, 0);
+            128, 128, 128, 128, 128, 128, 128, 128);
 
         private static readonly Vector256<sbyte> ShuffleBgMask256 = Vector256.Create(
             (sbyte)0, (sbyte)1, (sbyte)4, (sbyte)5, (sbyte)8, (sbyte)9, (sbyte)12, (sbyte)13,
@@ -503,6 +538,16 @@ namespace BitmapSIMDGrayScare
             (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0,
             (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
 
+    public readonly record struct ImageSpec(int Width, int Height, string Name)
+    {
+        public static ImageSpec Hd { get; } = new(1280, 720, "1280x720");
+        public static ImageSpec FullHd { get; } = new(1920, 1080, "1920x1080");
+
+        public int Stride => Width * 4;
+        public int BufferLength => Stride * Height;
+
+        public override string ToString() => Name;
     }
 }
