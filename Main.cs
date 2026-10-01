@@ -132,7 +132,7 @@ namespace BitmapSIMDGrayScare
                         Vector256<float> grayFloat = Avx.Add(Avx.Add(Avx.Multiply(redF, rWeight), Avx.Multiply(greenF, gWeight)), Avx.Multiply(blueF, bWeight));
                         grayFloat = Avx.Add(grayFloat, rounding);
 
-                        Vector256<int> grayInt = Avx.ConvertToVector256Int32(grayFloat);
+                        Vector256<int> grayInt = Avx.ConvertToVector256Int32WithTruncation(grayFloat);
                         grayInt = Avx2.Max(grayInt, zero);
                         grayInt = Avx2.Min(grayInt, max);
 
