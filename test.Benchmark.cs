@@ -20,9 +20,9 @@ namespace ConsoleApp67
         private const int RedWeight = 77;
         private const int GreenWeight = 150;
         private const int BlueWeight = 29;
-        private const float RedWeightFloat = 0.299f;
-        private const float GreenWeightFloat = 0.587f;
-        private const float BlueWeightFloat = 0.114f;
+        private const float RedWeightFloat = RedWeight / 256f;
+        private const float GreenWeightFloat = GreenWeight / 256f;
+        private const float BlueWeightFloat = BlueWeight / 256f;
         private const byte AlphaOpaque = 255;
 
         [ParamsSource(nameof(GetTestImages))]
@@ -41,7 +41,7 @@ namespace ConsoleApp67
 
         private static readonly Converter ScalarPath = ScalarGrayscale;
         private static readonly Converter Avx2Path = Avx2.IsSupported ? Avx2Grayscale : ScalarGrayscale;
-        private static readonly Converter Avx512Path = Avx512F.IsSupported && Avx512BW.IsSupported ? Avx512Grayscale : Avx2Path;
+        private static readonly Converter Avx512Path = Avx512F.IsSupported && Avx512BW.IsSupported && Avx2.IsSupported ? Avx512Grayscale : Avx2Path;
         private static readonly Converter FmaPath = Fma.IsSupported && Avx.IsSupported ? FmaGrayscale : Avx2Path;
         private static readonly Converter AdvSimdPath = AdvSimd.Arm64.IsSupported ? AdvSimdGrayscale : ScalarGrayscale;
 
@@ -202,7 +202,7 @@ namespace ConsoleApp67
 
         private static void Avx512Grayscale(byte* source, byte* destination, in ImageSpec spec)
         {
-            int simdWidth = spec.Width & ~31;
+            int simdWidth = spec.Width & ~15;
 
             for (int y = 0; y < spec.Height; y++)
             {
@@ -210,7 +210,7 @@ namespace ConsoleApp67
                 byte* dstRow = destination + y * spec.Stride;
 
                 int x = 0;
-                for (; x < simdWidth; x += 32)
+                for (; x < simdWidth; x += 16)
                 {
                     int offset = x * 4;
                     Vector512<byte> block = Avx512F.LoadVector512(srcRow + offset);
@@ -264,14 +264,14 @@ namespace ConsoleApp67
                         bufferR[i] = srcRow[pixelIndex + 2];
                     }
 
-                    Vector256<float> bVec = Unsafe.ReadUnaligned<Vector256<float>>(ref MemoryMarshal.GetReference(bufferB));
-                    Vector256<float> gVec = Unsafe.ReadUnaligned<Vector256<float>>(ref MemoryMarshal.GetReference(bufferG));
-                    Vector256<float> rVec = Unsafe.ReadUnaligned<Vector256<float>>(ref MemoryMarshal.GetReference(bufferR));
+                    Vector256<float> bVec = Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref MemoryMarshal.GetReference(bufferB)));
+                    Vector256<float> gVec = Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref MemoryMarshal.GetReference(bufferG)));
+                    Vector256<float> rVec = Unsafe.ReadUnaligned<Vector256<float>>(ref Unsafe.As<float, byte>(ref MemoryMarshal.GetReference(bufferR)));
 
                     Vector256<float> gray = Fma.MultiplyAdd(rVec, rWeight, Fma.MultiplyAdd(gVec, gWeight, Avx.Multiply(bVec, bWeight)));
                     gray = Avx.Add(gray, half);
 
-                    Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(grayTemp), gray);
+                    Unsafe.WriteUnaligned(ref Unsafe.As<float, byte>(ref MemoryMarshal.GetReference(grayTemp)), gray);
 
                     for (int i = 0; i < 8; i++)
                     {
@@ -302,11 +302,14 @@ namespace ConsoleApp67
 
         private static void ParallelAvx2Grayscale(byte* source, byte* destination, in ImageSpec spec)
         {
+            // An in parameter cannot be captured by a lambda. Capture scalar values.
+            int stride = spec.Stride;
+            int width = spec.Width;
             Parallel.For(0, spec.Height, RowParallelOptions, y =>
             {
-                byte* srcRow = source + y * spec.Stride;
-                byte* dstRow = destination + y * spec.Stride;
-                Avx2Row(srcRow, dstRow, spec.Width);
+                byte* srcRow = source + y * stride;
+                byte* dstRow = destination + y * stride;
+                Avx2Row(srcRow, dstRow, width);
             });
         }
 
@@ -376,78 +379,23 @@ namespace ConsoleApp67
 
         private static Vector256<byte> ConvertBlock256(Vector256<byte> bgra)
         {
-            Vector256<byte> bgPairs = Avx2.Shuffle(bgra, ShuffleBgMask256);
-            Vector256<short> bgWeighted = Avx2.MultiplyAddAdjacent(bgPairs, BgWeights256);
-
-            Vector256<byte> gPairs = Avx2.Shuffle(bgra, ShuffleGMask256);
-            Vector256<short> gWeighted = Avx2.MultiplyAddAdjacent(gPairs, GWeights256);
-
-            Vector256<byte> rPairs = Avx2.Shuffle(bgra, ShuffleRMask256);
-            Vector256<short> rWeighted = Avx2.MultiplyAddAdjacent(rPairs, RWeights256);
-
-            Vector256<short> sum = Avx2.Add(bgWeighted, gWeighted);
-            sum = Avx2.Add(sum, rWeighted);
-            sum = Avx2.Add(sum, Rounding256);
-
-            Vector256<ushort> gray16 = Avx2.ShiftRightLogical(sum.AsUInt16(), 8);
-            Vector256<byte> grayBytes = Avx2.PackUnsignedSaturate(gray16.AsInt16(), gray16.AsInt16());
-
-            Vector256<byte> replicated = Avx2.Shuffle(grayBytes, DuplicateGrayShuffle256);
-            return Avx2.Or(replicated, AlphaMask256);
+            // One 32-bit lane per BGRA pixel avoids signed-byte weights, saturating
+            // partial sums and 128-bit shuffle lane mistakes. Match scalar exactly.
+            Vector256<int> pixels = bgra.AsInt32();
+            Vector256<int> mask = Vector256.Create(255);
+            Vector256<int> blue = Avx2.And(pixels, mask);
+            Vector256<int> green = Avx2.And(Avx2.ShiftRightLogical(pixels, 8), mask);
+            Vector256<int> red = Avx2.And(Avx2.ShiftRightLogical(pixels, 16), mask);
+            Vector256<int> sum = Avx2.Add(
+                Avx2.Add(Avx2.MultiplyLow(blue, Vector256.Create(BlueWeight)),
+                         Avx2.MultiplyLow(green, Vector256.Create(GreenWeight))),
+                Avx2.MultiplyLow(red, Vector256.Create(RedWeight)));
+            Vector256<int> gray = Avx2.ShiftRightLogical(Avx2.Add(sum, Vector256.Create(128)), 8);
+            Vector256<int> packed = Avx2.Or(gray, Avx2.ShiftLeftLogical(gray, 8));
+            packed = Avx2.Or(packed, Avx2.ShiftLeftLogical(gray, 16));
+            return Avx2.Or(packed, Vector256.Create(unchecked((int)0xFF000000))).AsByte();
         }
 
-        private static readonly Vector256<byte> AlphaMask256 = Vector256.Create(
-            (byte)0, 0, 0, AlphaOpaque, 0, 0, 0, AlphaOpaque, 0, 0, 0, AlphaOpaque, 0, 0, 0, AlphaOpaque,
-            0, 0, 0, AlphaOpaque, 0, 0, 0, AlphaOpaque, 0, 0, 0, AlphaOpaque, 0, 0, 0, AlphaOpaque);
-
-        private static readonly Vector256<short> Rounding256 = Vector256.Create(
-            (short)128, 128, 128, 128, 128, 128, 128, 128,
-            128, 128, 128, 128, 128, 128, 128, 128);
-
-        private static readonly Vector256<sbyte> ShuffleBgMask256 = Vector256.Create(
-            (sbyte)0, (sbyte)1, (sbyte)4, (sbyte)5, (sbyte)8, (sbyte)9, (sbyte)12, (sbyte)13,
-            (sbyte)16, (sbyte)17, (sbyte)20, (sbyte)21, (sbyte)24, (sbyte)25, (sbyte)28, (sbyte)29,
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80));
-
-        private static readonly Vector256<sbyte> ShuffleGMask256 = Vector256.Create(
-            (sbyte)1, unchecked((sbyte)0x80), (sbyte)5, unchecked((sbyte)0x80), (sbyte)9, unchecked((sbyte)0x80), (sbyte)13, unchecked((sbyte)0x80),
-            (sbyte)17, unchecked((sbyte)0x80), (sbyte)21, unchecked((sbyte)0x80), (sbyte)25, unchecked((sbyte)0x80), (sbyte)29, unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80));
-
-        private static readonly Vector256<sbyte> ShuffleRMask256 = Vector256.Create(
-            (sbyte)2, unchecked((sbyte)0x80), (sbyte)6, unchecked((sbyte)0x80), (sbyte)10, unchecked((sbyte)0x80), (sbyte)14, unchecked((sbyte)0x80),
-            (sbyte)18, unchecked((sbyte)0x80), (sbyte)22, unchecked((sbyte)0x80), (sbyte)26, unchecked((sbyte)0x80), (sbyte)30, unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80),
-            unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80), unchecked((sbyte)0x80));
-
-        private static readonly Vector256<sbyte> DuplicateGrayShuffle256 = Vector256.Create(
-            (sbyte)0, (sbyte)0, (sbyte)0, unchecked((sbyte)0x80), (sbyte)1, (sbyte)1, (sbyte)1, unchecked((sbyte)0x80),
-            (sbyte)2, (sbyte)2, (sbyte)2, unchecked((sbyte)0x80), (sbyte)3, (sbyte)3, (sbyte)3, unchecked((sbyte)0x80),
-            (sbyte)4, (sbyte)4, (sbyte)4, unchecked((sbyte)0x80), (sbyte)5, (sbyte)5, (sbyte)5, unchecked((sbyte)0x80),
-            (sbyte)6, (sbyte)6, (sbyte)6, unchecked((sbyte)0x80), (sbyte)7, (sbyte)7, (sbyte)7, unchecked((sbyte)0x80));
-
-        private static readonly Vector256<sbyte> BgWeights256 = Vector256.Create(
-            (sbyte)29, (sbyte)22, (sbyte)29, (sbyte)22, (sbyte)29, (sbyte)22, (sbyte)29, (sbyte)22,
-            (sbyte)29, (sbyte)22, (sbyte)29, (sbyte)22, (sbyte)29, (sbyte)22, (sbyte)29, (sbyte)22,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-
-        private static readonly Vector256<sbyte> GWeights256 = Vector256.Create(
-            (sbyte)150, 0, (sbyte)150, 0, (sbyte)150, 0, (sbyte)150, 0,
-            (sbyte)150, 0, (sbyte)150, 0, (sbyte)150, 0, (sbyte)150, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-
-        private static readonly Vector256<sbyte> RWeights256 = Vector256.Create(
-            (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0,
-            (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0, (sbyte)77, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     public readonly record struct ImageSpec(int Width, int Height, string Name)
